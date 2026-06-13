@@ -60,7 +60,16 @@ def ims_reader(path,resLevel='max', colorsIndependant=False, preCache=False):
 # path = r"Z:\toTest\bil\download.brainimagelibrary.org\2b\da\2bdaf9e66a246844\mouseID_405429-182725\CH1_0.35_100um\ch1_0.35_100um.ims"
 # path = r"Z:\testData\2D\1time_1color_composite_z500_c488.ims"
     
-    squeeze_output = True
+    # NOTE: squeeze_output MUST be False.
+    # The ims object always reports a full 5D (t,c,z,y,x) .shape/.chunks, but
+    # when squeeze_output=True its __getitem__ returns np.squeeze(...) output.
+    # da.from_array trusts the declared 5D shape/chunks while the per-chunk
+    # loader hands back fewer-dimensional (squeezed) arrays, so on compute dask
+    # tries to index a squeezed chunk with 5 indices and raises
+    # "too many indices ... Array chunk size or shape is unknown".
+    # Singleton dimensions are instead dropped at the dask level below
+    # (see the inwardSlice logic), which keeps shape/chunks/getitem consistent.
+    squeeze_output = False
     imsClass = ims(path,squeeze_output=squeeze_output)
     
     try:
