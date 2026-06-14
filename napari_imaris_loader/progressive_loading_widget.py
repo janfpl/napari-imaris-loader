@@ -19,6 +19,8 @@ the slider range and world coordinates stay stable and no display settings need
 to be synchronised.
 """
 
+from collections.abc import Sequence
+
 import napari
 from magicgui import magic_factory
 
@@ -27,6 +29,29 @@ from qtpy.QtCore import QTimer
 from napari.layers import Image
 
 from ._logging import configure_logging, logger
+
+
+def _level_sequence(data):
+    """Return ``data`` as a sequence of pyramid levels, or ``None``.
+
+    napari exposes a multiscale layer's ``data`` either as a plain ``list``
+    (older versions / direct construction) or as a ``napari.layers``
+    ``MultiScaleData`` object.  The latter is a ``collections.abc.Sequence``
+    but is **not** a ``list``/``tuple`` subclass, so a naive
+    ``isinstance(data, (list, tuple))`` check silently rejects every real
+    multiscale layer.  Match on ``Sequence`` instead: ``list``/``tuple`` and
+    ``MultiScaleData`` all qualify, while a bare numpy/dask array (a single
+    plane) does not register as a ``Sequence`` and is correctly rejected.
+    """
+    if isinstance(data, (str, bytes)):
+        return None
+    if isinstance(data, Sequence):
+        try:
+            if len(data) >= 1:
+                return data
+        except TypeError:
+            return None
+    return None
 
 
 SCRUB_SUFFIX = ' [scrub]'
@@ -71,12 +96,35 @@ class _ProgressiveController:
         return len(data_levels) - 1
 
     def _make_scrub_layer(self, parent):
-        data_levels = parent.data
-        if not isinstance(data_levels, (list, tuple)) or len(data_levels) < 2:
+        is_multiscale = getattr(parent, 'multiscale', None)
+        # ``layer.data`` is a sequence of pyramid arrays for a multiscale layer
+        # (a ``list`` or a ``MultiScaleData`` sequence) and a single array
+        # otherwise.  Log exactly which case we hit so a session that reports
+        # "no multiscale layers to accelerate" can be diagnosed from the log.
+        data_levels = _level_sequence(parent.data)
+        if data_levels is None:
+            logger.info(
+                "progressive: skip '%s' - data is %s (multiscale=%s); "
+                "expected a sequence of pyramid levels",
+                parent.name, type(parent.data).__name__, is_multiscale,
+            )
             return None  # not multiscale -> scrubbing wouldn't help
+        if len(data_levels) < 2:
+            logger.info(
+                "progressive: skip '%s' - only %d resolution level(s) "
+                "(multiscale=%s); nothing coarser to scrub with",
+                parent.name, len(data_levels), is_multiscale,
+            )
+            return None
 
         level = self._choose_scrub_level(data_levels, self.scrub_max_pixels)
         if level == 0:
+            logger.info(
+                "progressive: skip '%s' - level 0 already fits scrub_max_pixels"
+                "=%d (XY=%s); nothing to gain",
+                parent.name, self.scrub_max_pixels,
+                tuple(data_levels[0].shape[-2:]),
+            )
             return None  # already cheap enough; nothing to gain
 
         coarse = data_levels[level]
@@ -111,11 +159,13 @@ class _ProgressiveController:
         return scrub
 
     def _build_scrub_layers(self):
+        candidates = 0
         for layer in list(self.viewer.layers):
             if not isinstance(layer, Image):
                 continue
             if layer.name.endswith(SCRUB_SUFFIX):
                 continue
+            candidates += 1
             try:
                 scrub = self._make_scrub_layer(layer)
             except Exception as exc:
@@ -124,6 +174,10 @@ class _ProgressiveController:
                 scrub = None
             if scrub is not None:
                 self._scrub_names[layer.name] = scrub.name
+        logger.info(
+            "progressive: inspected %d image layer(s), built %d scrub layer(s)",
+            candidates, len(self._scrub_names),
+        )
 
     def _remove_scrub_layers(self):
         # If we were mid-scrub, restore originals before tearing down.
