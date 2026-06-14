@@ -12,6 +12,7 @@ from napari_plugin_engine import napari_hook_implementation
 from .reader import ims_reader
 from ._logging import configure_logging, logger, timed_operation
 from .progressive_loading_widget import progressive_loading, purge_scrub_layers
+from .detail_cap_widget import detail_cap, reset_detail_cap
 import dask.array as da
 from typing import List
 from napari.layers import Image
@@ -107,6 +108,9 @@ def resolution_change(
     ## over the freshly reloaded data.
     purge_scrub_layers(viewer)
 
+    ## Forget any detail-cap originals; the reloaded pyramid replaces them.
+    reset_detail_cap(viewer)
+
     ## Locate a real IMS layer to reload from (the reader stamps 'fileName'
     ## into each layer's metadata; companion/other layers won't have it).
     source_path = None
@@ -189,5 +193,5 @@ def resolution_change(
 
 @napari_hook_implementation
 def napari_experimental_provide_dock_widget():
-    return [resolution_change, progressive_loading]
+    return [resolution_change, progressive_loading, detail_cap]
 

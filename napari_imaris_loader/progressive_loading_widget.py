@@ -113,6 +113,11 @@ class _ProgressiveController:
         self._scrub_names = {}        # parent name -> scrub layer name
         self._parent_visible = {}     # parent name -> bool (visibility to restore)
         self._scrubbing = False
+        # Background workers materialising scrub levels into RAM, and a build
+        # generation counter so results that arrive after a rebuild/teardown
+        # are ignored instead of overwriting fresh layers.
+        self._workers = []
+        self._build_gen = 0
         # Debounce restoring full-res after scrolling stops.
         self._timer = QTimer()
         self._timer.setSingleShot(True)
@@ -137,32 +142,74 @@ class _ProgressiveController:
                 return i
         return len(data_levels) - 1
 
-    def _maybe_load_to_ram(self, arr, name):
-        """Materialise a small scrub level into RAM so interaction is read-free.
+    def _schedule_ram_load(self, scrub_name, arr, parent_name):
+        """Materialise a small scrub level into RAM *off the UI thread*.
 
-        The companion otherwise wraps a lazy dask level, so every scrub/zoom
-        frame would still trigger HDF5 reads.  Levels above ``RAM_BUDGET_BYTES``
-        are kept lazy to avoid a long, blocking compute on enable.
+        The companion starts wrapping the lazy dask level (so it appears
+        immediately), and a background worker computes the array and swaps it
+        in when ready - turning the former ~1.7 s main-thread freeze on enable
+        into a non-blocking refine.  Levels above ``RAM_BUDGET_BYTES`` stay
+        lazy.
         """
         nbytes = getattr(arr, 'nbytes', None)
         if nbytes is not None and nbytes > self.RAM_BUDGET_BYTES:
             logger.info(
                 "progressive: '%s' scrub kept lazy (%.0f MiB > %.0f MiB budget)",
-                name, nbytes / 2 ** 20, self.RAM_BUDGET_BYTES / 2 ** 20,
+                parent_name, nbytes / 2 ** 20, self.RAM_BUDGET_BYTES / 2 ** 20,
             )
-            return arr
-        t = time.perf_counter()
+            return
+
+        gen = self._build_gen
+        t0 = time.perf_counter()
+
+        def _done(mem):
+            self._apply_loaded_scrub(scrub_name, mem, gen, parent_name,
+                                     (time.perf_counter() - t0) * 1000)
+
         try:
-            mem = np.asarray(arr)
-        except Exception as exc:
-            logger.warning("progressive: '%s' could not load scrub into RAM, "
-                           "staying lazy: %s", name, exc)
-            return arr
-        logger.info(
-            "progressive: '%s' scrub loaded into RAM (%.0f MiB) in %.0f ms",
-            name, mem.nbytes / 2 ** 20, (time.perf_counter() - t) * 1000,
+            from napari.qt.threading import create_worker
+        except Exception:
+            # No Qt threading available: fall back to a (blocking) load so the
+            # behaviour is still correct, just not backgrounded.
+            try:
+                _done(np.asarray(arr))
+            except Exception as exc:
+                logger.warning("progressive: '%s' RAM load failed: %s",
+                               parent_name, exc)
+            return
+
+        worker = create_worker(np.asarray, arr)
+        worker.returned.connect(_done)
+        worker.errored.connect(
+            lambda exc, pn=parent_name: logger.warning(
+                "progressive: '%s' background RAM load failed, staying lazy: %s",
+                pn, exc)
         )
-        return mem
+        # Hold a reference so the worker isn't garbage-collected mid-flight, and
+        # drop it when finished.
+        self._workers.append(worker)
+        worker.finished.connect(
+            lambda w=worker: self._workers.remove(w) if w in self._workers else None
+        )
+        worker.start()
+
+    def _apply_loaded_scrub(self, scrub_name, mem, gen, parent_name, elapsed_ms):
+        """Swap a freshly materialised array into its scrub layer (UI thread)."""
+        if gen != self._build_gen:
+            return  # layers were rebuilt/torn down while loading -> discard
+        if scrub_name not in self.viewer.layers:
+            return
+        try:
+            self.viewer.layers[scrub_name].data = mem
+        except Exception as exc:
+            logger.warning("progressive: '%s' could not swap in RAM scrub: %s",
+                           parent_name, exc)
+            return
+        logger.info(
+            "progressive: '%s' scrub loaded into RAM (%.0f MiB) in %.0f ms "
+            "(background)",
+            parent_name, getattr(mem, 'nbytes', 0) / 2 ** 20, elapsed_ms,
+        )
 
     def _make_scrub_layer(self, parent):
         is_multiscale = getattr(parent, 'multiscale', None)
@@ -204,8 +251,6 @@ class _ProgressiveController:
             pscale[d] * full_shape[d] / coarse_shape[d] for d in range(3)
         )
 
-        coarse = self._maybe_load_to_ram(coarse, parent.name)
-
         # Replacing an existing companion of the same name (e.g. after a
         # rebuild) avoids napari auto-suffixing duplicates ('... [scrub] [1]').
         scrub_name = parent.name + SCRUB_SUFFIX
@@ -215,6 +260,8 @@ class _ProgressiveController:
             except Exception:
                 pass
 
+        # Add immediately with the lazy level, then materialise into RAM in the
+        # background and swap it in (see _schedule_ram_load).
         scrub = self.viewer.add_image(
             coarse,
             name=scrub_name,
@@ -236,9 +283,11 @@ class _ProgressiveController:
             parent.name, level, len(data_levels) - 1, coarse_shape,
             xy_factor, self.scrub_max_pixels,
         )
+        self._schedule_ram_load(scrub_name, coarse, parent.name)
         return scrub
 
     def _build_scrub_layers(self):
+        self._build_gen += 1  # invalidate any still-running RAM loads
         candidates = 0
         for layer in list(self.viewer.layers):
             if not isinstance(layer, Image):
@@ -260,6 +309,7 @@ class _ProgressiveController:
         )
 
     def _remove_scrub_layers(self):
+        self._build_gen += 1  # discard results from any in-flight RAM loads
         # If we were mid-scrub, restore originals before tearing down.
         if self._scrubbing:
             self._restore_full_res()
