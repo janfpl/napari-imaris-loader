@@ -11,7 +11,7 @@ from napari_plugin_engine import napari_hook_implementation
 # from .h5layer import layerH5
 from .reader import ims_reader
 from ._logging import configure_logging, logger, timed_operation
-from .progressive_loading_widget import progressive_loading
+from .progressive_loading_widget import progressive_loading, purge_scrub_layers
 import dask.array as da
 from typing import List
 from napari.layers import Image
@@ -101,22 +101,36 @@ def resolution_change(
     logger.info("resolution_change widget invoked: lowest_resolution_level=%s",
                 lowest_resolution_level)
 
+    ## Remove any scrub companion layers first.  They carry no 'fileName'
+    ## metadata and overlay the real data, so leaving them in place both
+    ## crashes the source-layer lookup below and leaves stale low-res copies
+    ## over the freshly reloaded data.
+    purge_scrub_layers(viewer)
+
+    ## Locate a real IMS layer to reload from (the reader stamps 'fileName'
+    ## into each layer's metadata; companion/other layers won't have it).
+    source_path = None
+    for layer in viewer.layers:
+        source_path = getattr(layer, 'metadata', {}).get('fileName')
+        if source_path:
+            break
+    if not source_path:
+        logger.warning("resolution_change: no IMS layer with a 'fileName' found; "
+                       "nothing to reload")
+        return
+
     ## Load data for IMS file using the loader function
-    for idx in viewer.layers:
-        # print(viewer.layers[str(idx)].data)
-        try:
-            with timed_operation("ims_reader reload (resLevel=%s)" % lowest_resolution_level):
-                tupleOut = ims_reader(
-                    viewer.layers[str(idx)].metadata['fileName'],
-                    colorsIndependant=True,
-                    resLevel=lowest_resolution_level
-                    )
-        except ValueError as e:
-            logger.warning("resolution_change reload failed: %s", e)
-            print(e)
-            return
-        
-        break
+    try:
+        with timed_operation("ims_reader reload (resLevel=%s)" % lowest_resolution_level):
+            tupleOut = ims_reader(
+                source_path,
+                colorsIndependant=True,
+                resLevel=lowest_resolution_level
+                )
+    except ValueError as e:
+        logger.warning("resolution_change reload failed: %s", e)
+        print(e)
+        return
     '''tupleOut is a tuple for each channel in the ims file
     structured as: [ ( [listOfMultiscaleDataCh1],metaDataDict ), 
                    ( [listOfMultiscaleDataCh2],metaDataDict ) ]
