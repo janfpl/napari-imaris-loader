@@ -25,7 +25,23 @@ A plugin is provided to dynamically reload the data after selecting the lowest r
 * Chunks are implemented by dask and matched to the chunk sizes stored in each dataset.  (Napari appears to only ask for 2D chunks - unclear how helpful this feature is currently)
 * Successfully handles multi-terabyte multi-timepoint multi-channel datasets.
 * Tested with all sample files provided by Bitplane.
-* Higher 3D rendering quality is enabled by a widget that reloads data after specifying the lowest resolution level (higher number = lower resolution) to be included in the multiscale series.
+* Higher 3D rendering quality is enabled by a widget that reloads data after specifying the lowest resolution level (higher number = lower resolution) to be included in the multiscale series.  The resolution slider now offers only the resolution levels that actually exist in the open file.
+* **Progressive (scrub) loading** widget: while you scroll through planes a fast low-resolution image is shown, and the full-resolution plane is loaded shortly after you stop moving.  This keeps scrolling responsive when zoomed in to full resolution.  Find it under `Plugins > napari-imaris-loader > progressive_loading`, tick *enabled*, and (after reloading data with the resolution widget) re-toggle it to rebuild the helper layers.
+
+### Troubleshooting / verbose logging
+
+A hidden, opt-in logger can show where time is being spent (e.g. whether GUI sluggishness comes from data reads or from napari rendering).  It is silent and overhead-free unless switched on **before** launching napari:
+
+```
+# Windows (cmd)
+set NAPARI_IMARIS_LOG=DEBUG
+set NAPARI_IMARIS_LOG_FILE=C:\temp\imaris_loader.log
+# macOS / Linux
+export NAPARI_IMARIS_LOG=DEBUG
+export NAPARI_IMARIS_LOG_FILE=/tmp/imaris_loader.log
+```
+
+At `DEBUG` level every tile read is logged with its resolution level, slice, size and duration, which makes it easy to tell read-bound from render-bound slowness.
 
 ### Known Issues / limitations
 
