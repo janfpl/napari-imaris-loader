@@ -22,11 +22,14 @@ with options to maintain this cache persistantly accross sessions.
 """
 
 import os
+import time
 import numpy as np
 import dask.array as da
 from imaris_ims_file_reader.ims import ims
 
 from napari_plugin_engine import napari_hook_implementation
+
+from ._logging import configure_logging, debug_enabled, logger, TimedReader
 
 
 
@@ -69,8 +72,16 @@ def ims_reader(path,resLevel='max', colorsIndependant=False, preCache=False):
     # "too many indices ... Array chunk size or shape is unknown".
     # Singleton dimensions are instead dropped at the dask level below
     # (see the inwardSlice logic), which keeps shape/chunks/getitem consistent.
+    configure_logging()
+    _t_start = time.perf_counter()
+    logger.info("Opening IMS file via napari-imaris-loader: %s "
+                "(resLevel=%s, colorsIndependant=%s)", path, resLevel, colorsIndependant)
+
     squeeze_output = False
     imsClass = ims(path,squeeze_output=squeeze_output)
+    logger.info("File shape (t,c,z,y,x)=%s, channels=%s, resolutionLevels=%s, "
+                "dtype=%s, native chunks=%s", imsClass.shape, imsClass.Channels,
+                imsClass.ResolutionLevels, imsClass.dtype, imsClass.chunks)
     
     try:
         # Extract minimum resolution level and calculate contrast limits
@@ -109,20 +120,23 @@ def ims_reader(path,resLevel='max', colorsIndependant=False, preCache=False):
     
     data = []
     for rr in range(imsClass.ResolutionLevels):
-        print('Loading resolution level {}'.format(rr))
+        _t_level = time.perf_counter()
         data.append(ims(path,ResolutionLevelLock=rr,cache_location=imsClass.cache_location,squeeze_output=squeeze_output))
-        
-    # for ii in data:
-    #     print(ii.ResolutionLevelLock)
-        
+        logger.debug("Loaded resolution level %s shape=%s in %.1f ms", rr,
+                     data[-1].shape, (time.perf_counter() - _t_level) * 1000)
+
     chunks = True
+    _instrument = debug_enabled()
     for idx,_ in enumerate(data):
-        data[idx] = da.from_array(data[idx],
+        # When DEBUG logging is on, wrap each level so every tile read napari
+        # requests is timed.  Otherwise hand dask the raw ims object directly.
+        source = TimedReader(data[idx], idx) if _instrument else data[idx]
+        data[idx] = da.from_array(source,
                                   chunks=data[idx].chunks if chunks == True else (1,1,data[idx].shape[-3],data[idx].shape[-2],data[idx].shape[-1]),
                                   fancy=False
                                   )
-    
-    print(data)
+
+    logger.debug("Multiscale dask arrays: %s", [d.shape for d in data])
     # Base metadata that apply to all senarios
     meta = {
         "contrast_limits": contrastLimits,
@@ -187,8 +201,10 @@ def ims_reader(path,resLevel='max', colorsIndependant=False, preCache=False):
         raise ValueError('Selected resolution level is too high:  Options are between 0 and {}'.format(imsClass.ResolutionLevels-1))
     
     data = data if resLevel=='max' else data[:resLevel+1]
-    print(data)
-    
+    logger.info("Returning %s resolution level(s) to napari in %.1f ms; "
+                "shapes=%s", len(data), (time.perf_counter() - _t_start) * 1000,
+                [d.shape for d in data])
+
     # Set multiscale based on whether multiple resolutions are present
     meta["multiscale"] = True if len(data) > 1 else False
     

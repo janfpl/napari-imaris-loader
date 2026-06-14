@@ -10,6 +10,7 @@ from magicgui import magic_factory
 from napari_plugin_engine import napari_hook_implementation
 # from .h5layer import layerH5
 from .reader import ims_reader
+from ._logging import configure_logging, logger, timed_operation
 import dask.array as da
 from typing import List
 from napari.layers import Image
@@ -37,16 +38,22 @@ def resolution_change(
     selecting 3D rendering.
     '''
     
+    configure_logging()
+    logger.info("resolution_change widget invoked: lowest_resolution_level=%s",
+                lowest_resolution_level)
+
     ## Load data for IMS file using the loader function
     for idx in viewer.layers:
         # print(viewer.layers[str(idx)].data)
         try:
-            tupleOut = ims_reader(
-                viewer.layers[str(idx)].metadata['fileName'],
-                colorsIndependant=True,
-                resLevel=lowest_resolution_level
-                )
+            with timed_operation("ims_reader reload (resLevel=%s)" % lowest_resolution_level):
+                tupleOut = ims_reader(
+                    viewer.layers[str(idx)].metadata['fileName'],
+                    colorsIndependant=True,
+                    resLevel=lowest_resolution_level
+                    )
         except ValueError as e:
+            logger.warning("resolution_change reload failed: %s", e)
             print(e)
             return
         
