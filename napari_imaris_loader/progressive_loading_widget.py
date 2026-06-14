@@ -46,13 +46,24 @@ class _ProgressiveController:
         self._scrub_names = {}        # parent name -> scrub layer name
         self._parent_visible = {}     # parent name -> bool (visibility to restore)
         self._scrubbing = False
+        # Debounce restoring full-res after scrolling stops.
         self._timer = QTimer()
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._on_pause)
+        # Debounce rebuilding the scrub layers when the quality slider changes,
+        # so dragging the slider doesn't add/remove layers on every step.
+        self._rebuild_timer = QTimer()
+        self._rebuild_timer.setSingleShot(True)
+        self._rebuild_timer.timeout.connect(self._apply_rebuild)
 
     # -- construction of companion layers ---------------------------------
     @staticmethod
     def _choose_scrub_level(data_levels, max_pixels):
+        """Smallest-index level whose XY fits in ``max_pixels``.
+
+        Falls back to the coarsest available level when nothing is small
+        enough (i.e. the minimum slider position gives the lowest resolution).
+        """
         for i, arr in enumerate(data_levels):
             zyx = arr.shape[-3:]
             if max(zyx[-2:]) <= max_pixels:
@@ -90,18 +101,16 @@ class _ProgressiveController:
             multiscale=False,
             visible=False,
         )
+        xy_factor = full_shape[-1] / coarse_shape[-1]
         logger.info(
-            "progressive: scrub layer for '%s' uses level %d shape=%s",
-            parent.name, level, coarse_shape,
+            "progressive: '%s' scrub uses level %d of %d, shape=%s "
+            "(~%.0fx downsampled in XY, scrub_max_pixels=%d)",
+            parent.name, level, len(data_levels) - 1, coarse_shape,
+            xy_factor, self.scrub_max_pixels,
         )
         return scrub
 
-    # -- enable / disable -------------------------------------------------
-    def enable(self):
-        # Rebuild cleanly so re-toggling picks up the current layers/settings.
-        self.disable()
-        configure_logging()
-
+    def _build_scrub_layers(self):
         for layer in list(self.viewer.layers):
             if not isinstance(layer, Image):
                 continue
@@ -116,28 +125,11 @@ class _ProgressiveController:
             if scrub is not None:
                 self._scrub_names[layer.name] = scrub.name
 
-        if not self._scrub_names:
-            logger.info("progressive: no multiscale layers to accelerate")
-            return
-
-        self.viewer.dims.events.current_step.connect(self._on_scroll)
-        self.active = True
-        logger.info("progressive loading enabled (%d layer(s), delay=%d ms)",
-                    len(self._scrub_names), self.pause_delay_ms)
-
-    def disable(self):
-        if self.active:
-            try:
-                self.viewer.dims.events.current_step.disconnect(self._on_scroll)
-            except Exception:
-                pass
-        self._timer.stop()
-
+    def _remove_scrub_layers(self):
         # If we were mid-scrub, restore originals before tearing down.
         if self._scrubbing:
             self._restore_full_res()
-
-        for parent_name, scrub_name in list(self._scrub_names.items()):
+        for _parent_name, scrub_name in list(self._scrub_names.items()):
             if scrub_name in self.viewer.layers:
                 try:
                     self.viewer.layers.remove(scrub_name)
@@ -146,6 +138,46 @@ class _ProgressiveController:
         self._scrub_names.clear()
         self._parent_visible.clear()
         self._scrubbing = False
+
+    # -- enable / disable -------------------------------------------------
+    def enable(self, scrub_max_pixels):
+        configure_logging()
+        if self.active:
+            # Already running: only rebuild (debounced) if the quality changed.
+            if scrub_max_pixels != self.scrub_max_pixels:
+                self.scrub_max_pixels = scrub_max_pixels
+                self._rebuild_timer.start(300)
+            return
+
+        self.scrub_max_pixels = scrub_max_pixels
+        self._build_scrub_layers()
+        if not self._scrub_names:
+            logger.info("progressive: no multiscale layers to accelerate")
+            return
+
+        self.viewer.dims.events.current_step.connect(self._on_scroll)
+        self.active = True
+        logger.info("progressive loading enabled (%d layer(s), delay=%d ms, "
+                    "scrub_max_pixels=%d)", len(self._scrub_names),
+                    self.pause_delay_ms, self.scrub_max_pixels)
+
+    def _apply_rebuild(self):
+        if not self.active:
+            return
+        self._remove_scrub_layers()
+        self._build_scrub_layers()
+        logger.info("progressive: rebuilt scrub layers "
+                    "(scrub_max_pixels=%d)", self.scrub_max_pixels)
+
+    def disable(self):
+        if self.active:
+            try:
+                self.viewer.dims.events.current_step.disconnect(self._on_scroll)
+            except Exception:
+                pass
+        self._timer.stop()
+        self._rebuild_timer.stop()
+        self._remove_scrub_layers()
         self.active = False
 
     # -- scroll handling --------------------------------------------------
@@ -184,13 +216,15 @@ class _ProgressiveController:
     auto_call=True,
     enabled={'tooltip': 'Show a fast low-resolution image while scrolling, '
                         'then refine to full resolution when you pause.'},
-    pause_delay_ms={'min': 50, 'max': 2000, 'step': 50,
+    pause_delay_ms={'widget_type': 'Slider', 'min': 50, 'max': 2000, 'step': 50,
                     'tooltip': 'How long after scrolling stops before the '
                                'full-resolution image is restored.'},
-    scrub_max_pixels={'min': 128, 'max': 8192, 'step': 128,
+    scrub_max_pixels={'widget_type': 'Slider', 'min': 128, 'max': 8192,
+                      'step': 128,
                       'tooltip': 'Largest XY size (pixels) allowed for the '
-                                 'low-resolution scrubbing image. Smaller = '
-                                 'faster scrolling, blurrier while moving.'},
+                                 'low-resolution scrubbing image. Drag left for '
+                                 'a lower-resolution (faster, blockier) scrub; '
+                                 'the minimum uses the coarsest pyramid level.'},
 )
 def progressive_loading(
     viewer: napari.Viewer,
@@ -202,8 +236,9 @@ def progressive_loading(
 
     Enable this, then scroll through Z (or any slider dimension) at full zoom.
     While the slider moves you see a fast low-resolution image; shortly after
-    you stop, the full-resolution plane is loaded.  Toggle off (or re-toggle
-    after reloading data) to remove the helper layers.
+    you stop, the full-resolution plane is loaded.  Drag *scrub max pixels* to
+    the left for an even lower-resolution scrub image.  Toggle off (or
+    re-toggle after reloading data) to remove the helper layers.
     '''
     configure_logging()
     controller = _controllers.get(id(viewer))
@@ -212,9 +247,8 @@ def progressive_loading(
         _controllers[id(viewer)] = controller
 
     controller.pause_delay_ms = pause_delay_ms
-    controller.scrub_max_pixels = scrub_max_pixels
 
     if enabled:
-        controller.enable()
+        controller.enable(scrub_max_pixels)
     else:
         controller.disable()
