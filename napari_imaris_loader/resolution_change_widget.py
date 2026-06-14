@@ -76,22 +76,32 @@ def resolution_change(
         viewer.dims.ndisplay = 2
         
     for num,idx in enumerate(channelNames):
-        
+
+        layer = viewer.layers[str(idx)]
         tmp = {
-            'opacity':viewer.layers[str(idx)].opacity,
-            'gamma':viewer.layers[str(idx)].gamma,
-            'colormap':viewer.layers[str(idx)].colormap,
-            'blending':viewer.layers[str(idx)].blending,
-            'interpolation':viewer.layers[str(idx)].interpolation,
-            'visible':viewer.layers[str(idx)].visible,
-            'rendering':viewer.layers[str(idx)].rendering
-            
-            # 'contrast_limits_range':viewer.layers[str(idx)].contrast_limits
-            
+            'opacity':layer.opacity,
+            'gamma':layer.gamma,
+            'colormap':layer.colormap,
+            'blending':layer.blending,
+            'visible':layer.visible,
+            'rendering':layer.rendering
+
+            # 'contrast_limits_range':layer.contrast_limits
+
             }
-        
+
+        # napari 0.5+ split the single ``interpolation`` attribute into
+        # ``interpolation2d`` and ``interpolation3d``.  Preserve whichever the
+        # installed napari exposes so the rebuilt layers keep the user's choice
+        # and we stay compatible with older versions.
+        if hasattr(layer, 'interpolation2d'):
+            tmp['interpolation2d'] = layer.interpolation2d
+            tmp['interpolation3d'] = layer.interpolation3d
+        else:
+            tmp['interpolation'] = layer.interpolation
+
         tupleOut[num][1].update(tmp)
-        
+
         del(viewer.layers[str(idx)])
 
     ## Return the tuple data that will be loaded into the viewer
