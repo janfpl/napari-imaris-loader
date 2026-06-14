@@ -30,6 +30,7 @@ from imaris_ims_file_reader.ims import ims
 from napari_plugin_engine import napari_hook_implementation
 
 from ._logging import configure_logging, debug_enabled, logger, TimedReader
+from ._cache import ReadCache, CachingReader
 
 
 
@@ -127,10 +128,27 @@ def ims_reader(path,resLevel='max', colorsIndependant=False, preCache=False):
 
     chunks = True
     _instrument = debug_enabled()
+
+    # Shared, byte-bounded chunk cache.  The native IMS chunk is 32 planes
+    # deep, so every plane in a band maps to the same dask chunk key; without
+    # a cache, scrubbing/panning re-decompresses identical ~1 MiB chunks over
+    # and over (the dominant interactive cost found in profiling).  Sized via
+    # NAPARI_IMARIS_CACHE_MB (default 2048 MiB; set 0 to disable).
+    try:
+        _cache_mb = int(os.environ.get("NAPARI_IMARIS_CACHE_MB", "2048"))
+    except ValueError:
+        _cache_mb = 2048
+    read_cache = ReadCache(_cache_mb * 2 ** 20) if _cache_mb > 0 else None
+    logger.info("Chunk read cache: %s",
+                "%d MiB" % _cache_mb if read_cache is not None else "disabled")
+
     for idx,_ in enumerate(data):
         # When DEBUG logging is on, wrap each level so every tile read napari
-        # requests is timed.  Otherwise hand dask the raw ims object directly.
+        # requests is timed.  Then wrap with the cache so repeated chunk reads
+        # are served from RAM.  Otherwise hand dask the raw ims object.
         source = TimedReader(data[idx], idx) if _instrument else data[idx]
+        if read_cache is not None:
+            source = CachingReader(source, idx, read_cache)
         data[idx] = da.from_array(source,
                                   chunks=data[idx].chunks if chunks == True else (1,1,data[idx].shape[-3],data[idx].shape[-2],data[idx].shape[-1]),
                                   fancy=False
