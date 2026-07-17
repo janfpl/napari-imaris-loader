@@ -67,34 +67,6 @@ SCRUB_SUFFIX = ' [scrub]'
 _controllers = {}
 
 
-def purge_scrub_layers(viewer):
-    """Remove every scrub companion layer and deactivate the controller.
-
-    Scrub layers carry no ``fileName`` metadata and overlay the real data, so
-    they must be cleared before the data is reloaded at a new resolution -
-    otherwise the resolution widget can mistake one for a source layer
-    (``KeyError: 'fileName'``) and stale/duplicated companions
-    ('... [scrub] [1]') pile up over the freshly loaded layers.
-    """
-    controller = _controllers.get(id(viewer))
-    if controller is not None:
-        controller.disable()
-    # Sweep up any orphaned or auto-suffixed duplicates the controller no
-    # longer tracks.
-    removed = 0
-    for layer in list(viewer.layers):
-        if isinstance(layer, Image) and SCRUB_SUFFIX in layer.name:
-            try:
-                viewer.layers.remove(layer)
-                removed += 1
-            except Exception:
-                pass
-    if removed:
-        logger.info("progressive: purged %d scrub layer(s) before reload",
-                    removed)
-    return removed
-
-
 class _ProgressiveController:
     """Wires dimension-scroll events to a low-res/high-res visibility swap."""
 
@@ -127,6 +99,13 @@ class _ProgressiveController:
         self._rebuild_timer = QTimer()
         self._rebuild_timer.setSingleShot(True)
         self._rebuild_timer.timeout.connect(self._apply_rebuild)
+        # Debounce healing after layers are inserted (e.g. a resolution reload
+        # replaces the IMS layers): build companions for the new layers once
+        # the batch of insertions settles.
+        self._heal_timer = QTimer()
+        self._heal_timer.setSingleShot(True)
+        self._heal_timer.timeout.connect(self._heal_inserted)
+        self._layer_events_connected = False
 
     # -- construction of companion layers ---------------------------------
     @staticmethod
@@ -142,7 +121,7 @@ class _ProgressiveController:
                 return i
         return len(data_levels) - 1
 
-    def _schedule_ram_load(self, scrub_name, arr, parent_name):
+    def _schedule_ram_load(self, scrub_name, arr, parent_name, cache=None):
         """Materialise a small scrub level into RAM *off the UI thread*.
 
         The companion starts wrapping the lazy dask level (so it appears
@@ -150,6 +129,10 @@ class _ProgressiveController:
         in when ready - turning the former ~1.7 s main-thread freeze on enable
         into a non-blocking refine.  Levels above ``RAM_BUDGET_BYTES`` stay
         lazy.
+
+        ``cache`` (the shared chunk read cache, if any) has its writes paused
+        for the duration of the bulk read so materialising this coarse level
+        does not evict the hot fine-level chunks the cache exists to keep.
         """
         nbytes = getattr(arr, 'nbytes', None)
         if nbytes is not None and nbytes > self.RAM_BUDGET_BYTES:
@@ -161,6 +144,15 @@ class _ProgressiveController:
 
         gen = self._build_gen
         t0 = time.perf_counter()
+
+        if cache is not None:
+            cache.pause_writes()
+        _resumed = {'done': False}
+
+        def _resume():
+            if cache is not None and not _resumed['done']:
+                _resumed['done'] = True
+                cache.resume_writes()
 
         def _done(mem):
             self._apply_loaded_scrub(scrub_name, mem, gen, parent_name,
@@ -176,6 +168,8 @@ class _ProgressiveController:
             except Exception as exc:
                 logger.warning("progressive: '%s' RAM load failed: %s",
                                parent_name, exc)
+            finally:
+                _resume()
             return
 
         worker = create_worker(np.asarray, arr)
@@ -185,12 +179,17 @@ class _ProgressiveController:
                 "progressive: '%s' background RAM load failed, staying lazy: %s",
                 pn, exc)
         )
-        # Hold a reference so the worker isn't garbage-collected mid-flight, and
-        # drop it when finished.
+        # Hold a reference so the worker isn't garbage-collected mid-flight;
+        # resume cache writes and drop the reference when finished (success or
+        # error).
         self._workers.append(worker)
-        worker.finished.connect(
-            lambda w=worker: self._workers.remove(w) if w in self._workers else None
-        )
+
+        def _finished(w=worker):
+            _resume()
+            if w in self._workers:
+                self._workers.remove(w)
+
+        worker.finished.connect(_finished)
         worker.start()
 
     def _apply_loaded_scrub(self, scrub_name, mem, gen, parent_name, elapsed_ms):
@@ -244,11 +243,14 @@ class _ProgressiveController:
             return None  # already cheap enough; nothing to gain
 
         coarse = data_levels[level]
-        full_shape = data_levels[0].shape[-3:]
-        coarse_shape = coarse.shape[-3:]
-        pscale = tuple(parent.scale[-3:])
+        # Use the last min(3, ndim) spatial dims so 2D (y,x) layers work too;
+        # hard-coding 3 IndexErrors on 2D multiscale data.
+        ndim = min(3, len(parent.scale))
+        full_shape = data_levels[0].shape[-ndim:]
+        coarse_shape = coarse.shape[-ndim:]
+        pscale = tuple(parent.scale[-ndim:])
         sscale = tuple(
-            pscale[d] * full_shape[d] / coarse_shape[d] for d in range(3)
+            pscale[d] * full_shape[d] / coarse_shape[d] for d in range(ndim)
         )
 
         # Replacing an existing companion of the same name (e.g. after a
@@ -283,16 +285,25 @@ class _ProgressiveController:
             parent.name, level, len(data_levels) - 1, coarse_shape,
             xy_factor, self.scrub_max_pixels,
         )
-        self._schedule_ram_load(scrub_name, coarse, parent.name)
+        parent_meta = getattr(parent, 'metadata', None) or {}
+        cache = parent_meta.get('_ims_read_cache')
+        self._schedule_ram_load(scrub_name, coarse, parent.name, cache=cache)
         return scrub
 
     def _build_scrub_layers(self):
-        self._build_gen += 1  # invalidate any still-running RAM loads
         candidates = 0
+        built = 0
         for layer in list(self.viewer.layers):
             if not isinstance(layer, Image):
                 continue
-            if layer.name.endswith(SCRUB_SUFFIX):
+            # ``in`` (not ``endswith``) so an auto-suffixed orphan like
+            # 'Ch0 [scrub] [1]' is treated as a companion, never a parent.
+            if SCRUB_SUFFIX in layer.name:
+                continue
+            # Skip parents that already have a live companion (so healing after
+            # an insertion only builds for genuinely new layers).
+            existing = self._scrub_names.get(layer.name)
+            if existing is not None and existing in self.viewer.layers:
                 continue
             candidates += 1
             try:
@@ -303,9 +314,11 @@ class _ProgressiveController:
                 scrub = None
             if scrub is not None:
                 self._scrub_names[layer.name] = scrub.name
+                built += 1
         logger.info(
-            "progressive: inspected %d image layer(s), built %d scrub layer(s)",
-            candidates, len(self._scrub_names),
+            "progressive: inspected %d new image layer(s), built %d scrub "
+            "layer(s) (%d tracked total)",
+            candidates, built, len(self._scrub_names),
         )
 
     def _remove_scrub_layers(self):
@@ -341,11 +354,78 @@ class _ProgressiveController:
 
         self.viewer.dims.events.current_step.connect(self._on_interact)
         self._connect_camera()
+        self._connect_layer_events()
         self.active = True
         logger.info("progressive loading enabled (%d layer(s), delay=%d ms, "
                     "scrub_max_pixels=%d, zoom/pan accelerated)",
                     len(self._scrub_names), self.pause_delay_ms,
                     self.scrub_max_pixels)
+
+    def _connect_layer_events(self):
+        """Self-heal when layers are added/removed (e.g. a resolution reload).
+
+        Rebuilding companions for freshly inserted layers keeps the toggle live
+        across a reload, and dropping companions whose parent was removed avoids
+        stale overlays - without the resolution widget having to reach in and
+        purge.
+        """
+        if self._layer_events_connected:
+            return
+        try:
+            self.viewer.layers.events.inserted.connect(self._on_layers_inserted)
+            self.viewer.layers.events.removed.connect(self._on_layers_removed)
+            self._layer_events_connected = True
+        except Exception as exc:
+            logger.warning("progressive: could not hook layer events "
+                           "(no self-heal on reload): %s", exc)
+
+    def _disconnect_layer_events(self):
+        if not self._layer_events_connected:
+            return
+        try:
+            self.viewer.layers.events.inserted.disconnect(self._on_layers_inserted)
+        except Exception:
+            pass
+        try:
+            self.viewer.layers.events.removed.disconnect(self._on_layers_removed)
+        except Exception:
+            pass
+        self._layer_events_connected = False
+
+    def _on_layers_inserted(self, event=None):
+        # Debounce so a batch of insertions heals once, off the event stack.
+        if self.active:
+            self._heal_timer.start(200)
+
+    def _heal_inserted(self):
+        if not self.active:
+            return
+        before = len(self._scrub_names)
+        self._build_scrub_layers()
+        if len(self._scrub_names) != before:
+            logger.info("progressive: healed after layer insertion "
+                        "(%d companion(s) tracked)", len(self._scrub_names))
+
+    def _on_layers_removed(self, event=None):
+        removed = getattr(event, 'value', None)
+        name = getattr(removed, 'name', None)
+        if name is None:
+            return
+        # A tracked parent went away: drop and remove its companion.
+        if name in self._scrub_names:
+            scrub_name = self._scrub_names.pop(name)
+            self._parent_visible.pop(name, None)
+            if scrub_name in self.viewer.layers:
+                try:
+                    self.viewer.layers.remove(scrub_name)
+                except Exception:
+                    pass
+            return
+        # A companion was removed directly: forget its tracking entry.
+        for pname, sname in list(self._scrub_names.items()):
+            if sname == name:
+                self._scrub_names.pop(pname, None)
+                self._parent_visible.pop(pname, None)
 
     def _connect_camera(self):
         """Swap to low-res while the camera zooms or pans, not only on scroll."""
@@ -385,8 +465,10 @@ class _ProgressiveController:
             except Exception:
                 pass
             self._disconnect_camera()
+        self._disconnect_layer_events()
         self._timer.stop()
         self._rebuild_timer.stop()
+        self._heal_timer.stop()
         self._remove_scrub_layers()
         self.active = False
 

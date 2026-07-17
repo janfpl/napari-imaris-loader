@@ -28,20 +28,6 @@ from .progressive_loading_widget import _level_sequence, SCRUB_SUFFIX
 _cap_controllers = {}
 
 
-def reset_detail_cap(viewer):
-    """Forget captured originals for a viewer (call after reloading data).
-
-    A resolution reload recreates layers with the same names but a different
-    pyramid, so any cached 'original' pyramid for those names is stale and must
-    be dropped.
-    """
-    controller = _cap_controllers.get(id(viewer))
-    if controller is not None:
-        controller._timer.stop()
-        controller._original.clear()
-        controller._current.clear()
-
-
 def _capped_scale(base_scale, base_shape, level_shape):
     """Scale for a layer whose finest level becomes ``level_shape``.
 
@@ -70,15 +56,46 @@ class _DetailCapController:
 
     def __init__(self, viewer):
         self.viewer = viewer
-        # parent name -> (full_data_list, base_scale_tuple) captured before any
-        # cap so the original can always be restored / re-capped.
-        self._original = {}
-        # parent name -> currently applied cap level, to skip redundant work.
-        self._current = {}
+        # Keyed by id(layer), NOT name: identity survives a rename, and layer
+        # removal is caught by the events below so an entry never outlives its
+        # layer (which would otherwise restore a stale pyramid onto a same-named
+        # replacement).
+        self._original = {}   # id(layer) -> (full_data_list, base_scale_tuple)
+        self._current = {}    # id(layer) -> currently applied cap level
+        self._last_level = 0  # last requested cap, re-applied to new layers
         self._pending = 0
         self._timer = QTimer()
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._apply_pending)
+        # Debounce re-applying the cap to layers inserted later (e.g. after a
+        # resolution reload) so the cap persists without an external reset hook.
+        self._heal_timer = QTimer()
+        self._heal_timer.setSingleShot(True)
+        self._heal_timer.timeout.connect(self._heal_inserted)
+        self._connect_layer_events()
+
+    def _connect_layer_events(self):
+        try:
+            self.viewer.layers.events.inserted.connect(self._on_layers_inserted)
+            self.viewer.layers.events.removed.connect(self._on_layers_removed)
+        except Exception as exc:
+            logger.warning("detail_cap: could not hook layer events "
+                           "(cap won't persist across reload): %s", exc)
+
+    def _on_layers_inserted(self, event=None):
+        if self._last_level:
+            self._heal_timer.start(200)
+
+    def _heal_inserted(self):
+        if self._last_level:
+            self.apply(self._last_level)
+
+    def _on_layers_removed(self, event=None):
+        removed = getattr(event, 'value', None)
+        if removed is None:
+            return
+        self._original.pop(id(removed), None)
+        self._current.pop(id(removed), None)
 
     def _ims_layers(self):
         for layer in self.viewer.layers:
@@ -92,6 +109,7 @@ class _DetailCapController:
 
     def request(self, level, debounce_ms=250):
         """Debounce slider drags so we only re-point layers once per pause."""
+        self._last_level = int(level)
         self._pending = int(level)
         self._timer.start(debounce_ms)
 
@@ -100,6 +118,11 @@ class _DetailCapController:
 
     def apply(self, level):
         configure_logging()
+        # Belt-and-suspenders: drop entries for layers no longer present in case
+        # a removal event was ever missed.
+        live = {id(layer) for layer in self.viewer.layers}
+        self._original = {k: v for k, v in self._original.items() if k in live}
+        self._current = {k: v for k, v in self._current.items() if k in live}
         applied = 0
         for layer in list(self._ims_layers()):
             if self._apply_to_layer(layer, level):
@@ -107,17 +130,17 @@ class _DetailCapController:
         logger.info("detail_cap: applied level=%d to %d layer(s)", level, applied)
 
     def _apply_to_layer(self, layer, level):
-        name = layer.name
-        if name not in self._original:
+        key = id(layer)
+        if key not in self._original:
             full = _level_sequence(layer.data)
             if full is None or len(full) < 2:
                 return False
-            self._original[name] = ([d for d in full], tuple(layer.scale))
-        full_data, base_scale = self._original[name]
+            self._original[key] = ([d for d in full], tuple(layer.scale))
+        full_data, base_scale = self._original[key]
         n = len(full_data)
         # Always keep at least two levels so the layer stays multiscale.
         level = max(0, min(int(level), n - 2))
-        if self._current.get(name) == level:
+        if self._current.get(key) == level:
             return False  # already at this cap; avoid a redundant re-render
         new_data = full_data[level:]
         base_shape = full_data[0].shape
@@ -127,12 +150,12 @@ class _DetailCapController:
             layer.data = new_data
             layer.scale = new_scale
         except Exception as exc:
-            logger.warning("detail_cap: failed to cap '%s': %s", name, exc)
+            logger.warning("detail_cap: failed to cap '%s': %s", layer.name, exc)
             return False
-        self._current[name] = level
+        self._current[key] = level
         logger.info(
             "detail_cap: '%s' capped at level %d (kept %d level(s), base XY=%s)",
-            name, level, len(new_data), tuple(lvl_shape[-2:]),
+            layer.name, level, len(new_data), tuple(lvl_shape[-2:]),
         )
         return True
 

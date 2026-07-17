@@ -11,8 +11,8 @@ from napari_plugin_engine import napari_hook_implementation
 # from .h5layer import layerH5
 from .reader import ims_reader
 from ._logging import configure_logging, logger, timed_operation
-from .progressive_loading_widget import progressive_loading, purge_scrub_layers
-from .detail_cap_widget import detail_cap, reset_detail_cap
+from .progressive_loading_widget import progressive_loading
+from .detail_cap_widget import detail_cap
 import dask.array as da
 from typing import List
 from napari.layers import Image
@@ -102,17 +102,12 @@ def resolution_change(
     logger.info("resolution_change widget invoked: lowest_resolution_level=%s",
                 lowest_resolution_level)
 
-    ## Remove any scrub companion layers first.  They carry no 'fileName'
-    ## metadata and overlay the real data, so leaving them in place both
-    ## crashes the source-layer lookup below and leaves stale low-res copies
-    ## over the freshly reloaded data.
-    purge_scrub_layers(viewer)
-
-    ## Forget any detail-cap originals; the reloaded pyramid replaces them.
-    reset_detail_cap(viewer)
-
     ## Locate a real IMS layer to reload from (the reader stamps 'fileName'
-    ## into each layer's metadata; companion/other layers won't have it).
+    ## into each layer's metadata; scrub companions and other layers won't have
+    ## it, so they're skipped).  Do this *before* any destructive work so a
+    ## failed reload leaves the viewer untouched.  The scrub/detail-cap
+    ## controllers self-heal via layer add/remove events, so no explicit purge
+    ## is needed here.
     source_path = None
     for layer in viewer.layers:
         source_path = getattr(layer, 'metadata', {}).get('fileName')
@@ -160,6 +155,14 @@ def resolution_change(
         viewer.dims.ndisplay = 2
         
     for num,idx in enumerate(channelNames):
+
+        # A layer may be missing if the user renamed or removed it; skip its
+        # state preservation instead of raising KeyError mid-teardown.
+        if str(idx) not in viewer.layers:
+            logger.warning("resolution_change: layer '%s' not found (renamed or "
+                           "removed); reloading without preserving its settings",
+                           idx)
+            continue
 
         layer = viewer.layers[str(idx)]
         tmp = {

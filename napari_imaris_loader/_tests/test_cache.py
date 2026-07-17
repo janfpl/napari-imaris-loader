@@ -70,6 +70,34 @@ def test_cache_skips_oversized_and_empty():
     assert cache.cur_bytes == 0
 
 
+def test_cache_pause_suppresses_writes_but_not_reads():
+    cache = ReadCache(10_000)
+    cache.put(('warm',), _FakeArr(100))
+    cache.pause_writes()
+    cache.put(('new',), _FakeArr(100))     # suppressed while paused
+    assert cache.get(('new',)) is None
+    assert cache.get(('warm',)) is not None  # reads still hit while paused
+    cache.resume_writes()
+    cache.put(('new',), _FakeArr(100))
+    assert cache.get(('new',)) is not None
+
+
+def test_cache_pause_is_reentrant():
+    cache = ReadCache(10_000)
+    cache.pause_writes()
+    cache.pause_writes()
+    cache.resume_writes()
+    cache.put(('k',), _FakeArr(100))
+    assert cache.get(('k',)) is None       # still paused (nested)
+    cache.resume_writes()
+    cache.put(('k',), _FakeArr(100))
+    assert cache.get(('k',)) is not None
+    # Over-resuming must not drop below zero and re-block writes.
+    cache.resume_writes()
+    cache.put(('k2',), _FakeArr(100))
+    assert cache.get(('k2',)) is not None
+
+
 def test_caching_reader_serves_repeats_and_delegates():
     cache = ReadCache(10_000)
     backing = _FakeReader()

@@ -155,12 +155,15 @@ def ims_reader(path,resLevel='max', colorsIndependant=False, preCache=False):
                                   )
 
     logger.debug("Multiscale dask arrays: %s", [d.shape for d in data])
-    # Base metadata that apply to all senarios
+    # Base metadata that apply to all senarios.  The read cache is stamped in
+    # so companion widgets (e.g. the scrub loader) can pause its writes while
+    # bulk-materialising a level, avoiding eviction of hot chunks.
     meta = {
         "contrast_limits": contrastLimits,
         "name": channelNames,
         "metadata": {'fileName':imsClass.filePathComplete,
-                     'resolutionLevels':imsClass.ResolutionLevels
+                     'resolutionLevels':imsClass.ResolutionLevels,
+                     '_ims_read_cache':read_cache
                      }
         }
 
