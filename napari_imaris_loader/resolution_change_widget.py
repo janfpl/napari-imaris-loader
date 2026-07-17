@@ -10,15 +10,76 @@ from magicgui import magic_factory
 from napari_plugin_engine import napari_hook_implementation
 # from .h5layer import layerH5
 from .reader import ims_reader
+from ._logging import configure_logging, logger, timed_operation
+from .progressive_loading_widget import progressive_loading
+from .detail_cap_widget import detail_cap
 import dask.array as da
 from typing import List
 from napari.layers import Image
 
 
+def _detect_resolution_levels(viewer):
+    """Return the number of resolution levels of the loaded IMS data.
+
+    The reader stamps ``resolutionLevels`` into each layer's metadata.  We use
+    that so the slider only offers levels that actually exist.  Returns ``None``
+    when no IMS layer is present yet.
+    """
+    for layer in viewer.layers:
+        levels = getattr(layer, 'metadata', {}).get('resolutionLevels')
+        if levels:
+            return int(levels)
+    return None
+
+
+def _resolution_widget_init(widget):
+    """Keep the ``lowest_resolution_level`` slider bounded to the levels that
+    actually exist in the currently loaded file (instead of a hard-coded 0-9).
+    """
+
+    def _refresh(*_):
+        try:
+            viewer = widget.viewer.value
+            if viewer is None:
+                return
+            levels = _detect_resolution_levels(viewer)
+            if not levels:
+                return
+            slider = widget.lowest_resolution_level
+            slider.max = max(0, levels - 1)
+            if slider.value > slider.max:
+                slider.value = slider.max
+        except Exception:
+            # Never let dynamic UI tuning break the widget itself.
+            pass
+
+    def _hook_viewer(*_):
+        viewer = widget.viewer.value
+        if viewer is None:
+            return
+        # Avoid connecting more than once.
+        if getattr(widget, '_imaris_levels_hooked', False):
+            _refresh()
+            return
+        try:
+            viewer.layers.events.inserted.connect(_refresh)
+            viewer.layers.events.removed.connect(_refresh)
+            widget._imaris_levels_hooked = True
+        except Exception:
+            pass
+        _refresh()
+
+    try:
+        widget.viewer.changed.connect(_hook_viewer)
+    except Exception:
+        pass
+    _hook_viewer()
+
 
 @magic_factory(auto_call=False,call_button="update",
+                widget_init=_resolution_widget_init,
                 lowest_resolution_level={'min': 0,'max': 9,
-                                  'tooltip':'''Important only for 3D rendering.  
+                                  'tooltip':'''Important only for 3D rendering.
                                   Higher number is lower resolution.'''
                                   }
                 )
@@ -37,20 +98,38 @@ def resolution_change(
     selecting 3D rendering.
     '''
     
+    configure_logging()
+    logger.info("resolution_change widget invoked: lowest_resolution_level=%s",
+                lowest_resolution_level)
+
+    ## Locate a real IMS layer to reload from (the reader stamps 'fileName'
+    ## into each layer's metadata; scrub companions and other layers won't have
+    ## it, so they're skipped).  Do this *before* any destructive work so a
+    ## failed reload leaves the viewer untouched.  The scrub/detail-cap
+    ## controllers self-heal via layer add/remove events, so no explicit purge
+    ## is needed here.
+    source_path = None
+    for layer in viewer.layers:
+        source_path = getattr(layer, 'metadata', {}).get('fileName')
+        if source_path:
+            break
+    if not source_path:
+        logger.warning("resolution_change: no IMS layer with a 'fileName' found; "
+                       "nothing to reload")
+        return
+
     ## Load data for IMS file using the loader function
-    for idx in viewer.layers:
-        # print(viewer.layers[str(idx)].data)
-        try:
+    try:
+        with timed_operation("ims_reader reload (resLevel=%s)" % lowest_resolution_level):
             tupleOut = ims_reader(
-                viewer.layers[str(idx)].metadata['fileName'],
+                source_path,
                 colorsIndependant=True,
                 resLevel=lowest_resolution_level
                 )
-        except ValueError as e:
-            print(e)
-            return
-        
-        break
+    except ValueError as e:
+        logger.warning("resolution_change reload failed: %s", e)
+        print(e)
+        return
     '''tupleOut is a tuple for each channel in the ims file
     structured as: [ ( [listOfMultiscaleDataCh1],metaDataDict ), 
                    ( [listOfMultiscaleDataCh2],metaDataDict ) ]
@@ -76,22 +155,40 @@ def resolution_change(
         viewer.dims.ndisplay = 2
         
     for num,idx in enumerate(channelNames):
-        
+
+        # A layer may be missing if the user renamed or removed it; skip its
+        # state preservation instead of raising KeyError mid-teardown.
+        if str(idx) not in viewer.layers:
+            logger.warning("resolution_change: layer '%s' not found (renamed or "
+                           "removed); reloading without preserving its settings",
+                           idx)
+            continue
+
+        layer = viewer.layers[str(idx)]
         tmp = {
-            'opacity':viewer.layers[str(idx)].opacity,
-            'gamma':viewer.layers[str(idx)].gamma,
-            'colormap':viewer.layers[str(idx)].colormap,
-            'blending':viewer.layers[str(idx)].blending,
-            'interpolation':viewer.layers[str(idx)].interpolation,
-            'visible':viewer.layers[str(idx)].visible,
-            'rendering':viewer.layers[str(idx)].rendering
-            
-            # 'contrast_limits_range':viewer.layers[str(idx)].contrast_limits
-            
+            'opacity':layer.opacity,
+            'gamma':layer.gamma,
+            'colormap':layer.colormap,
+            'blending':layer.blending,
+            'visible':layer.visible,
+            'rendering':layer.rendering
+
+            # 'contrast_limits_range':layer.contrast_limits
+
             }
-        
+
+        # napari 0.5+ split the single ``interpolation`` attribute into
+        # ``interpolation2d`` and ``interpolation3d``.  Preserve whichever the
+        # installed napari exposes so the rebuilt layers keep the user's choice
+        # and we stay compatible with older versions.
+        if hasattr(layer, 'interpolation2d'):
+            tmp['interpolation2d'] = layer.interpolation2d
+            tmp['interpolation3d'] = layer.interpolation3d
+        else:
+            tmp['interpolation'] = layer.interpolation
+
         tupleOut[num][1].update(tmp)
-        
+
         del(viewer.layers[str(idx)])
 
     ## Return the tuple data that will be loaded into the viewer
@@ -99,5 +196,5 @@ def resolution_change(
 
 @napari_hook_implementation
 def napari_experimental_provide_dock_widget():
-    return resolution_change
+    return [resolution_change, progressive_loading, detail_cap]
 
