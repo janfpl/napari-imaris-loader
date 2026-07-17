@@ -16,6 +16,7 @@ safe size; set to ``0`` to disable) and shared across every resolution level
 and channel so the memory budget is global.
 """
 
+import logging
 import threading
 from collections import OrderedDict
 
@@ -38,6 +39,8 @@ def _normalize_key(key):
 class ReadCache:
     """Byte-bounded LRU cache of decompressed chunk arrays (thread-safe)."""
 
+    _STATS_EVERY = 256  # log running stats once per this many requests
+
     def __init__(self, max_bytes):
         self.max_bytes = int(max_bytes)
         self._lock = threading.Lock()
@@ -45,6 +48,9 @@ class ReadCache:
         self.cur_bytes = 0
         self.hits = 0
         self.misses = 0
+        # >0 suppresses writes (e.g. during a bulk scrub materialisation that
+        # would otherwise evict hot fine-level chunks); reads still hit.
+        self._paused = 0
 
     def get(self, key):
         with self._lock:
@@ -54,7 +60,28 @@ class ReadCache:
                 self.hits += 1
             else:
                 self.misses += 1
+            # Log running stats under the lock (accurate counters) and only
+            # when DEBUG is actually enabled, so the default hot path pays
+            # nothing.
+            total = self.hits + self.misses
+            if total % self._STATS_EVERY == 0 and logger.isEnabledFor(logging.DEBUG):
+                rate = (self.hits / total * 100.0) if total else 0.0
+                logger.debug(
+                    "cache stats: hit_rate=%.1f%% (hits=%d misses=%d) "
+                    "entries=%d %.0f MiB",
+                    rate, self.hits, self.misses, len(self._store),
+                    self.cur_bytes / 2 ** 20,
+                )
             return arr
+
+    def pause_writes(self):
+        with self._lock:
+            self._paused += 1
+
+    def resume_writes(self):
+        with self._lock:
+            if self._paused > 0:
+                self._paused -= 1
 
     def put(self, key, arr):
         nbytes = int(getattr(arr, 'nbytes', 0) or 0)
@@ -62,6 +89,8 @@ class ReadCache:
         if nbytes <= 0 or nbytes > self.max_bytes:
             return
         with self._lock:
+            if self._paused:
+                return
             if key in self._store:
                 self._store.move_to_end(key)
                 return
@@ -94,8 +123,6 @@ class CachingReader:
     cache helped.
     """
 
-    _STATS_EVERY = 256  # log running stats once per this many requests
-
     def __init__(self, reader, level, cache):
         object.__setattr__(self, "_reader", reader)
         object.__setattr__(self, "_level", level)
@@ -107,14 +134,6 @@ class CachingReader:
     def __getitem__(self, key):
         ckey = (self._level, _normalize_key(key))
         cached = self._cache.get(ckey)
-        total = self._cache.hits + self._cache.misses
-        if total % self._STATS_EVERY == 0:
-            s = self._cache.stats()
-            logger.debug(
-                "cache stats: hit_rate=%.1f%% (hits=%d misses=%d) "
-                "entries=%d %.0f MiB",
-                s['hit_rate'], s['hits'], s['misses'], s['entries'], s['mib'],
-            )
         if cached is not None:
             return cached
         result = self._reader[key]
